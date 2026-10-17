@@ -76,6 +76,20 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 		}, nil
 	}
 
+	// If this command was issued from a stray thread hanging off an echo post,
+	// operate on the real thread the echo post refers to instead: quote, thread
+	// reply and KV mappings all use the real root. Without this promotion the
+	// paired thread reply would be created in the stray thread and immediately
+	// redirected — which loses its attachments (a FileInfo can only ever be
+	// attached to a post once) and breaks the edit-sync pairing.
+	if realRootID, _ := rootPost.GetProp(ricThreadRootIDProp).(string); realRootID != "" && realRootID != rootPost.Id {
+		if realRoot, realErr := p.API.GetPost(realRootID); realErr == nil {
+			rootPost = realRoot
+		} else {
+			p.API.LogWarn("Could not load original thread root, staying in current thread", "root_id", args.RootId, "original_root_id", realRootID, "error", realErr.Error())
+		}
+	}
+
 	// Get the root post author
 	rootAuthor, appErr := p.API.GetUser(rootPost.UserId)
 	if appErr != nil {
@@ -96,7 +110,7 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 		ChannelId: args.ChannelId,
 		Message:   formatQuotedReply(rootAuthor.Username, rootPost.Message, message, ""),
 	}
-	channelPost.AddProp(ricThreadRootIDProp, args.RootId)
+	channelPost.AddProp(ricThreadRootIDProp, rootPost.Id)
 
 	// Attach recovered files to the channel post (use copies so originals go to thread)
 	if len(orphanedFileIds) > 0 {
@@ -118,7 +132,7 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 	}
 
 	// Store mapping from thread root ID → channel post IDs so MessageHasBeenPosted can find them
-	p.addRicPostMapping(args.RootId, createdChannelPost.Id)
+	p.addRicPostMapping(rootPost.Id, createdChannelPost.Id)
 
 	// Create the thread reply with a link to the channel post
 	channelPostLink := p.buildPermalink(createdChannelPost, args.UserId)
@@ -133,7 +147,7 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 	threadPost := &model.Post{
 		UserId:    args.UserId,
 		ChannelId: args.ChannelId,
-		RootId:    args.RootId,
+		RootId:    rootPost.Id,
 		Message:   threadMessage,
 	}
 
@@ -232,9 +246,8 @@ func (p *Plugin) redirectReplyToOriginalThread(post *model.Post) bool {
 		return false // thread root is a regular post, nothing to redirect
 	}
 	if origRootID == post.RootId {
-		// Degenerate echo post (/ric issued from an old stray thread, pointing
-		// at its own root): leave the reply where it is.
-		p.API.LogWarn("ric redirect: echo post points at its own root, leaving reply", "post_id", post.Id, "root_id", post.RootId)
+		// Possible manual DB edit or imported data; a move here would only churn the reply through a copy-delete cycle inside its own thread, so leave it where the user typed it.
+		p.API.LogWarn("ric redirect: echo post's ric_thread_root_id points at itself (should not happen), leaving reply in place", "post_id", post.Id, "root_id", post.RootId)
 		return true
 	}
 
@@ -245,19 +258,30 @@ func (p *Plugin) redirectReplyToOriginalThread(post *model.Post) bool {
 	}
 
 	// Re-create the reply in the original thread, preserving author, content,
-	// files and timestamps so it reads exactly like a normal thread reply.
-	// Re-attaching FileIds re-points the FileInfos at the new post before the
-	// stray post is deleted, so the attachments survive the move.
+	// and timestamps so it reads exactly like a normal thread reply.
 	moved := &model.Post{
 		UserId:    post.UserId,
 		ChannelId: post.ChannelId,
 		RootId:    origRootID,
 		Message:   post.Message,
-		FileIds:   post.FileIds,
 		CreateAt:  post.CreateAt,
 		UpdateAt:  post.UpdateAt,
 	}
 	moved.AddProp(ricRedirectedFromProp, post.Id)
+
+	// Attachments must be duplicated, not moved: the store only ever attaches a
+	// FileInfo while it is unattached (PostId == "", file_info_store.AttachToPost),
+	// so reusing the stray post's file ids would silently create the moved post
+	// without files. CopyFileInfos is the same mechanism ExecuteCommand uses.
+	if len(post.FileIds) > 0 {
+		copiedFileIds, copyErr := p.API.CopyFileInfos(post.UserId, []string(post.FileIds))
+		if copyErr != nil {
+			// Fail open: a text-only copy of the reply beats no reply at all.
+			p.API.LogWarn("ric redirect: failed to copy attachments, moved reply will be text-only", "post_id", post.Id, "error", copyErr.Error())
+		} else {
+			moved.FileIds = model.StringArray(copiedFileIds)
+		}
+	}
 
 	created, appErr := p.API.CreatePost(moved)
 	if appErr != nil {
