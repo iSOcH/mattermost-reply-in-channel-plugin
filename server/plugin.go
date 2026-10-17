@@ -276,11 +276,14 @@ func (p *Plugin) redirectReplyToOriginalThread(post *model.Post) bool {
 	if len(post.FileIds) > 0 {
 		copiedFileIds, copyErr := p.API.CopyFileInfos(post.UserId, []string(post.FileIds))
 		if copyErr != nil {
-			// Fail open: a text-only copy of the reply beats no reply at all.
-			p.API.LogWarn("ric redirect: failed to copy attachments, moved reply will be text-only", "post_id", post.Id, "error", copyErr.Error())
-		} else {
-			moved.FileIds = model.StringArray(copiedFileIds)
+			// Nothing is committed yet at this point, so abort rather than
+			// move a copy that would strip the reply's attachments: leaving
+			// the reply in place keeps it intact, losing the image is not
+			// recoverable for the user.
+			p.API.LogWarn("ric redirect: failed to copy attachments, leaving reply in place", "post_id", post.Id, "error", copyErr.Error())
+			return true
 		}
+		moved.FileIds = model.StringArray(copiedFileIds)
 	}
 
 	created, appErr := p.API.CreatePost(moved)

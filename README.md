@@ -103,7 +103,7 @@ Since the channel post needs a link to the thread reply (and vice versa), and ne
 ## Limitations
 
 - **File attachments**: Mattermost's slash command API does not pass file attachment IDs to plugins. The plugin attempts to recover recently uploaded orphaned files, but this is best-effort and may not work in all cases. If attachments don't appear, try posting the file separately.
-- **Reply redirect mechanics**: The redirect is implemented as copy-then-soft-delete (the plugin API cannot re-parent an existing post). Consequences: the stray reply shows as "(message deleted)" to anyone who had that thread open, permalinks shared to the stray reply stop working, and the moved post gets a new ID (timestamps preserved; attachments are carried by duplicated file infos, since a FileInfo can only ever be attached to a post once). Editing a reply into a `/ric` echo post's thread is not redirected — only new posts.
+- **Reply redirect mechanics**: The redirect is implemented as copy-then-soft-delete (the plugin API cannot re-parent an existing post). Consequences: the stray reply shows as "(message deleted)" to anyone who had that thread open, permalinks shared to the stray reply stop working, and the moved post gets a new ID (timestamps preserved; attachments are carried by duplicated file infos, since a FileInfo can only ever be attached to a post once — if that duplication fails, the redirect aborts and the reply stays in the stray thread with its attachments rather than moving as a lossy text-only copy). Editing a reply into a `/ric` echo post's thread is not redirected — only new posts.
 
 ## Security
 
