@@ -55,6 +55,7 @@ From within any thread, type:
 - **Long message truncation**: Original messages over 200 characters are truncated in the quote
 - **Permalink support**: Both the channel post and thread reply include clickable links to each other
 - **Live "view newer replies" link**: When new replies are added to a thread that was shared via `/ric`, the channel post automatically updates with a "view newer replies" link pointing to the latest reply
+- **Reply redirect**: Replying to a `/ric` channel post (which would otherwise start an unintended new thread under it) automatically moves that reply into the original thread; the replier gets an ephemeral note — visible only to them — with a link to where it went
 - **Bidirectional edit sync**: Editing either the channel post or the thread post automatically syncs the change to the other — they behave as one post
 - **DM/GM support**: Works in direct messages and group messages (picks the user's first team for permalink construction)
 
@@ -85,7 +86,7 @@ This is a server-only plugin (no webapp component). All functionality is impleme
 
 - **Slash command** (`/ric`) registered in `OnActivate`
 - **`ExecuteCommand`** hook handles the command, creates posts via `p.API.CreatePost()`, and builds permalinks
-- **`MessageHasBeenPosted`** hook listens for new thread replies and updates `/ric` channel posts with a "view newer replies" link
+- **`MessageHasBeenPosted`** hook listens for new thread replies and updates `/ric` channel posts with a "view newer replies" link; replies posted into a `/ric` echo post's thread are moved into the original thread (the stray post is soft-deleted and the moved copy carries a `ric_redirected_from` prop recording it)
 - **`MessageHasBeenUpdated`** hook syncs edits bidirectionally between paired channel/thread posts
 - **KV store** maps thread root IDs to `/ric` channel post IDs, and stores bidirectional post pair mappings for edit sync
 - **`formatQuotedReply`** handles message formatting (quoting, truncation, URL defanging, blockquote stripping)
@@ -101,6 +102,7 @@ Since the channel post needs a link to the thread reply (and vice versa), and ne
 ## Limitations
 
 - **File attachments**: Mattermost's slash command API does not pass file attachment IDs to plugins. The plugin attempts to recover recently uploaded orphaned files, but this is best-effort and may not work in all cases. If attachments don't appear, try posting the file separately.
+- **Reply redirect mechanics**: The redirect is implemented as copy-then-soft-delete (the plugin API cannot re-parent an existing post). Consequences: the stray reply shows as "(message deleted)" to anyone who had that thread open, permalinks shared to the stray reply stop working, and the moved post gets a new ID (timestamps and attachments are preserved). Editing a reply into a `/ric` echo post's thread is not redirected — only new posts.
 
 ## Security
 

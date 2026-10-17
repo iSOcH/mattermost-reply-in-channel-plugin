@@ -1,6 +1,6 @@
 {
   "id": "reply-in-channel",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "name": "Reply in Channel",
   "description": "Discord-style Reply in Channel - reply to any message inline with a blockquote of the original",
   "homepage_url": "https://github.com/bed/mattermost-reply-in-channel-plugin",

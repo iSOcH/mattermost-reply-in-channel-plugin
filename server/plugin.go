@@ -10,6 +10,16 @@ import (
 	"github.com/mattermost/mattermost/server/public/plugin"
 )
 
+// Props stamped on posts created or moved by this plugin.
+const (
+	// ricThreadRootIDProp links a /ric channel echo post to the root of the thread it echoes.
+	ricThreadRootIDProp = "ric_thread_root_id"
+
+	// ricRedirectedFromProp marks a reply that was moved out of the stray thread
+	// hanging off a /ric echo post, recording the stray post it replaces.
+	ricRedirectedFromProp = "ric_redirected_from"
+)
+
 // Plugin implements the interface expected by the Mattermost server to communicate between the server and plugin processes.
 type Plugin struct {
 	plugin.MattermostPlugin
@@ -86,7 +96,7 @@ func (p *Plugin) ExecuteCommand(c *plugin.Context, args *model.CommandArgs) (*mo
 		ChannelId: args.ChannelId,
 		Message:   formatQuotedReply(rootAuthor.Username, rootPost.Message, message, ""),
 	}
-	channelPost.AddProp("ric_thread_root_id", args.RootId)
+	channelPost.AddProp(ricThreadRootIDProp, args.RootId)
 
 	// Attach recovered files to the channel post (use copies so originals go to thread)
 	if len(orphanedFileIds) > 0 {
@@ -164,7 +174,15 @@ func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 	}
 
 	// Skip posts created by /ric (avoid update loops)
-	if post.GetProp("ric_thread_root_id") != nil {
+	if post.GetProp(ricThreadRootIDProp) != nil {
+		return
+	}
+
+	// Replies that landed in the stray thread under a /ric echo post belong in
+	// the original thread: move them there instead of growing that stray thread.
+	// A moved copy is never redirected again, but like any other thread reply
+	// it flows through the "view newer replies" logic below.
+	if post.GetProp(ricRedirectedFromProp) == nil && p.redirectReplyToOriginalThread(post) {
 		return
 	}
 	if strings.Contains(post.Message, "Also sent to") {
@@ -198,6 +216,93 @@ func (p *Plugin) MessageHasBeenPosted(c *plugin.Context, post *model.Post) {
 	}
 }
 
+// redirectReplyToOriginalThread moves a reply that was posted inside the stray
+// thread hanging off a /ric channel echo post into the original thread the echo
+// post refers to. The stray post is soft-deleted (audit trail), and the replier
+// gets an ephemeral note explaining where their reply went — visible only to
+// them, never stored. Returns true when the reply belongs to a /ric echo post
+// and has been fully handled here, false for regular replies.
+func (p *Plugin) redirectReplyToOriginalThread(post *model.Post) bool {
+	echoPost, appErr := p.API.GetPost(post.RootId)
+	if appErr != nil {
+		return false
+	}
+	origRootID, _ := echoPost.GetProp(ricThreadRootIDProp).(string)
+	if origRootID == "" {
+		return false // thread root is a regular post, nothing to redirect
+	}
+	if origRootID == post.RootId {
+		// Degenerate echo post (/ric issued from an old stray thread, pointing
+		// at its own root): leave the reply where it is.
+		p.API.LogWarn("ric redirect: echo post points at its own root, leaving reply", "post_id", post.Id, "root_id", post.RootId)
+		return true
+	}
+
+	originalRoot, appErr := p.API.GetPost(origRootID)
+	if appErr != nil || originalRoot.DeleteAt != 0 {
+		p.API.LogWarn("ric redirect: original thread root missing, leaving reply in place", "post_id", post.Id, "original_root_id", origRootID)
+		return true
+	}
+
+	// Re-create the reply in the original thread, preserving author, content,
+	// files and timestamps so it reads exactly like a normal thread reply.
+	// Re-attaching FileIds re-points the FileInfos at the new post before the
+	// stray post is deleted, so the attachments survive the move.
+	moved := &model.Post{
+		UserId:    post.UserId,
+		ChannelId: post.ChannelId,
+		RootId:    origRootID,
+		Message:   post.Message,
+		FileIds:   post.FileIds,
+		CreateAt:  post.CreateAt,
+		UpdateAt:  post.UpdateAt,
+	}
+	moved.AddProp(ricRedirectedFromProp, post.Id)
+
+	created, appErr := p.API.CreatePost(moved)
+	if appErr != nil {
+		// Fail open: a reply in the wrong thread beats a lost reply.
+		p.API.LogWarn("ric redirect: failed to copy reply into original thread, leaving it in place", "post_id", post.Id, "original_root_id", origRootID, "error", appErr.Error())
+		return true
+	}
+
+	// Mirror any reactions captured during the move window (usually none).
+	reactions, rErr := p.API.GetReactions(post.Id)
+	if rErr != nil {
+		p.API.LogWarn("ric redirect: failed to read reactions on stray reply", "post_id", post.Id, "error", rErr.Error())
+	}
+	for _, reaction := range reactions {
+		mirror := &model.Reaction{
+			UserId:    reaction.UserId,
+			PostId:    created.Id,
+			EmojiName: reaction.EmojiName,
+			ChannelId: created.ChannelId, // both posts live in the same channel
+		}
+		if _, mErr := p.API.AddReaction(mirror); mErr != nil {
+			p.API.LogWarn("ric redirect: failed to mirror reaction onto moved reply", "post_id", post.Id, "error", mErr.Error())
+		}
+	}
+
+	// Soft-delete the stray reply. It keeps its id and a delete marker, and the
+	// moved copy records it via the ric_redirected_from prop.
+	if appErr := p.API.DeletePost(post.Id); appErr != nil {
+		p.API.LogWarn("ric redirect: failed to delete stray reply, it may appear twice", "post_id", post.Id, "error", appErr.Error())
+	}
+
+	// Tell the replier (and only the replier) where their message went. The note
+	// is channel-level: the stray thread it was written into no longer exists,
+	// and the original thread shows the reply itself.
+	if permalink := p.buildPermalink(created, post.UserId); permalink != "" {
+		p.API.SendEphemeralPost(post.UserId, &model.Post{
+			UserId:    post.UserId,
+			ChannelId: post.ChannelId,
+			Message:   fmt.Sprintf("Your reply to the thread shared in this channel was moved to the [original thread](%s). Only you can see this note.", permalink),
+		})
+	}
+
+	return true
+}
+
 // MessageHasBeenUpdated syncs edits between paired /ric channel posts and thread posts.
 func (p *Plugin) MessageHasBeenUpdated(c *plugin.Context, newPost *model.Post, oldPost *model.Post) {
 	// Only care about message text changes
@@ -217,7 +322,7 @@ func (p *Plugin) MessageHasBeenUpdated(c *plugin.Context, newPost *model.Post, o
 		return
 	}
 
-	isChannelPost := newPost.GetProp("ric_thread_root_id") != nil
+	isChannelPost := newPost.GetProp(ricThreadRootIDProp) != nil
 
 	var newMessage string
 	if isChannelPost {
